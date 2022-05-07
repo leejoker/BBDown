@@ -37,7 +37,8 @@ namespace BBDown
             if (aria2cPath == null)
             {
                 Console.Write("aria2c未找到，是否自动安装[y/N](y): ");
-                autoInstall = Console.ReadLine() == "y";
+                var userInput = Console.ReadLine();
+                autoInstall = userInput == null || "".Equals(userInput.Trim()) || "y".Equals(userInput.Trim());
 
                 if (autoInstall)
                 {
@@ -874,7 +875,7 @@ namespace BBDown
             return null;
         }
 
-        private static async Task<bool> InstallAria2()
+        private static async Task InstallAria2()
         {
             if (OperatingSystem.IsWindows())
             {
@@ -895,23 +896,16 @@ namespace BBDown
                 var client = new HtmlWeb();
                 var doc = client.Load("https://github.com/aria2/aria2");
                 var aNode = doc.DocumentNode.SelectSingleNode("//*[@id=\"repo-content-pjax-container\"]/div/div/div[3]/div[2]/div/div[2]/div/a");
-
-                if (aNode == null)
-                    return false;
-
-                var htmlAttribute = aNode.Attributes[2];
-
-                if (htmlAttribute == null)
-                    return false;
-
-                var href = htmlAttribute.Value;
-                var tag = href[(href.LastIndexOf("/", StringComparison.Ordinal) + 1)..];
-                var release = tag.Split("-");
-                var downloadUrl = $"https://github.com/aria2/aria2/releases/download/{tag}/aria2-{release[1]}-win-{osBit}bit-build1.zip";
+                var htmlAttribute = aNode?.Attributes[2];
+                var href = htmlAttribute?.Value;
+                var tag = href?[(href.LastIndexOf("/", StringComparison.Ordinal) + 1)..];
+                var release = tag?.Split("-");
+                var downloadUrl = $"https://github.com/aria2/aria2/releases/download/{tag}/aria2-{release?[1]}-win-{osBit}bit-build1.zip";
 
                 if (!File.Exists($"{installPath}\\aria2.zip"))
                 {
                     await PackageDownload(downloadUrl, "aria2.zip", $"{installPath}\\aria2.zip");
+                    Console.WriteLine("Done");
                     Log("aria2下载完成");
                 }
                 else
@@ -947,8 +941,6 @@ namespace BBDown
             {
                 await UnixInstall("brew", "install aria2");
             }
-
-            return FindExecutable("aria2c") != null;
         }
 
         private static async Task<int> UnixInstall(string command, string args)
@@ -998,6 +990,7 @@ namespace BBDown
         {
             using var progress = new ProgressBar();
 
+            Console.Write("开始下载: ");
             await DownloadFileProgress(url, tmpName, (downloaded, total) => progress.Report((double) downloaded / total));
             File.Move(tmpName, path, true);
         }
@@ -1006,22 +999,18 @@ namespace BBDown
         {
             DateTimeOffset? lastTime = File.Exists(tmpName) ? new FileInfo(tmpName).LastWriteTimeUtc : null;
 
-            await using var fileStream = new FileStream(tmpName, FileMode.OpenOrCreate);
-
-            var fromPosition = 0;
-
-            long? toPosition = null;
+            await using var fileStream = new FileStream(tmpName ?? throw new ArgumentNullException(nameof(tmpName)), FileMode.OpenOrCreate);
 
             fileStream.Seek(0, SeekOrigin.End);
-            var downloadedBytes = fromPosition + fileStream.Position;
+            var downloadedBytes = fileStream.Position;
 
             using var httpRequestMessage = new HttpRequestMessage();
             if (!url.Contains("platform=android_tv_yst") && !url.Contains("platform=android"))
                 httpRequestMessage.Headers.TryAddWithoutValidation("Referer", "https://www.bilibili.com");
             httpRequestMessage.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0");
-            httpRequestMessage.Headers.Range = new(downloadedBytes, toPosition);
-            httpRequestMessage.Headers.IfRange = lastTime != null ? new(lastTime.Value) : null;
-            httpRequestMessage.RequestUri = new(url);
+            httpRequestMessage.Headers.Range = new RangeHeaderValue(downloadedBytes, null);
+            httpRequestMessage.Headers.IfRange = lastTime != null ? new RangeConditionHeaderValue(lastTime.Value) : null;
+            httpRequestMessage.RequestUri = new Uri(url);
 
             using var response = (await AppHttpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead)).EnsureSuccessStatusCode();
 
@@ -1046,7 +1035,7 @@ namespace BBDown
                 await fileStream.WriteAsync(buffer.AsMemory(0, recevied));
                 await fileStream.FlushAsync();
                 downloadedBytes += recevied;
-                onProgress(downloadedBytes - fromPosition, totalBytes);
+                onProgress(downloadedBytes, totalBytes);
             }
         }
     }
