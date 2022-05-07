@@ -1,5 +1,4 @@
-﻿using ICSharpCode.SharpZipLib.GZip;
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Specialized;
@@ -7,16 +6,17 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Net.Cache;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
+using HCGStudio.DistributionChecker;
+using HtmlAgilityPack;
+using ICSharpCode.SharpZipLib.Zip;
 using static BBDown.Core.Entity.Entity;
 using static BBDown.Core.Logger;
 using static BBDown.Core.Util.HTTPUtil;
@@ -25,6 +25,32 @@ namespace BBDown
 {
     static class BBDownUtil
     {
+        public static async Task DoctorAsync()
+        {
+            Log("开始检查BBDown环境依赖, 若不通过本程序进行依赖安装，请自行下载,并将文件放置于BBDown.exe文件相同目录下");
+            var aria2cPath = FindExecutable("aria2c");
+            var ffmpegPath = FindExecutable("ffmpeg");
+            var mp4boxPath = FindExecutable("mp4box");
+
+            bool autoInstall;
+
+            if (aria2cPath == null)
+            {
+                Console.Write("aria2c未找到，是否自动安装[y/N](y): ");
+                autoInstall = Console.ReadLine() == "y";
+
+                if (autoInstall)
+                {
+                    await InstallAria2();
+                }
+            }
+            else
+            {
+                Log($"找到aria2c, {aria2cPath}");
+            }
+
+            Log("Done!");
+        }
         public static async Task CheckUpdateAsync()
         {
             try
@@ -846,6 +872,182 @@ namespace BBDown
                 }
             }
             return null;
+        }
+
+        private static async Task<bool> InstallAria2()
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                var installPath = $"{Program.APP_DIR}/Install_Cache";
+
+                var osBit = 64;
+
+                if (!Directory.Exists(installPath))
+                {
+                    Directory.CreateDirectory(installPath);
+                }
+
+                if (!Environment.Is64BitOperatingSystem)
+                {
+                    osBit = 32;
+                }
+
+                var client = new HtmlWeb();
+                var doc = client.Load("https://github.com/aria2/aria2");
+                var aNode = doc.DocumentNode.SelectSingleNode("//*[@id=\"repo-content-pjax-container\"]/div/div/div[3]/div[2]/div/div[2]/div/a");
+
+                if (aNode == null)
+                    return false;
+
+                var htmlAttribute = aNode.Attributes[2];
+
+                if (htmlAttribute == null)
+                    return false;
+
+                var href = htmlAttribute.Value;
+                var tag = href[(href.LastIndexOf("/", StringComparison.Ordinal) + 1)..];
+                var release = tag.Split("-");
+                var downloadUrl = $"https://github.com/aria2/aria2/releases/download/{tag}/aria2-{release[1]}-win-{osBit}bit-build1.zip";
+
+                if (!File.Exists($"{installPath}\\aria2.zip"))
+                {
+                    await PackageDownload(downloadUrl, "aria2.zip", $"{installPath}\\aria2.zip");
+                    Log("aria2下载完成");
+                }
+                else
+                {
+                    Log("找到aria2安装包");
+                }
+
+                await UnzipFile($"{installPath}\\aria2.zip", "aria2c.exe");
+                Log("aria2已安装, 删除aria2安装包");
+                File.Delete($"{installPath}\\aria2.zip");
+                Log("aria2安装完成");
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                var distribution = new DistributionChecker().GetDistribution();
+
+                if (distribution.IsLikeDebian())
+                {
+                    await UnixInstall("sudo apt", "install -y aria2");
+                }
+
+                if (distribution.IsLikeCentOS())
+                {
+                    await UnixInstall("sudo yum", "install -y aria2");
+                }
+
+                if (distribution.IsLikeArchLinux())
+                {
+                    await UnixInstall("sudo pacman", "-Sy --noconfirm aria2");
+                }
+            }
+            else if (OperatingSystem.IsMacOS())
+            {
+                await UnixInstall("brew", "install aria2");
+            }
+
+            return FindExecutable("aria2c") != null;
+        }
+
+        private static async Task<int> UnixInstall(string command, string args)
+        {
+            using var p = new Process();
+            p.StartInfo.UseShellExecute = false;
+            p.StartInfo.RedirectStandardOutput = false;
+            p.StartInfo.FileName = command;
+            p.StartInfo.Arguments = args;
+            p.Start();
+            await p.WaitForExitAsync();
+
+            return p.ExitCode;
+        }
+
+        private static async Task UnzipFile(string path, string selectFile = null)
+        {
+            await using var zipFile = new ZipInputStream(File.OpenRead(path));
+
+            while (zipFile.GetNextEntry() is {} entry)
+            {
+                if (!entry.Name.Contains("aria2c.exe"))
+                    continue;
+
+                await using var streamWriter = File.Create(selectFile != null ? Program.APP_DIR + $"/{selectFile}" : Program.APP_DIR);
+                var data = new byte[2048];
+
+                while (true)
+                {
+                    var size = zipFile.Read(data, 0, data.Length);
+
+                    if (size > 0)
+                    {
+                        streamWriter.Write(data, 0, size);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                break;
+            }
+        }
+
+        private static async Task PackageDownload(string url, string tmpName, string path)
+        {
+            using var progress = new ProgressBar();
+
+            await DownloadFileProgress(url, tmpName, (downloaded, total) => progress.Report((double) downloaded / total));
+            File.Move(tmpName, path, true);
+        }
+
+        private static async Task DownloadFileProgress(string url, string tmpName, Action<long, long> onProgress)
+        {
+            DateTimeOffset? lastTime = File.Exists(tmpName) ? new FileInfo(tmpName).LastWriteTimeUtc : null;
+
+            await using var fileStream = new FileStream(tmpName, FileMode.OpenOrCreate);
+
+            var fromPosition = 0;
+
+            long? toPosition = null;
+
+            fileStream.Seek(0, SeekOrigin.End);
+            var downloadedBytes = fromPosition + fileStream.Position;
+
+            using var httpRequestMessage = new HttpRequestMessage();
+            if (!url.Contains("platform=android_tv_yst") && !url.Contains("platform=android"))
+                httpRequestMessage.Headers.TryAddWithoutValidation("Referer", "https://www.bilibili.com");
+            httpRequestMessage.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0");
+            httpRequestMessage.Headers.Range = new(downloadedBytes, toPosition);
+            httpRequestMessage.Headers.IfRange = lastTime != null ? new(lastTime.Value) : null;
+            httpRequestMessage.RequestUri = new(url);
+
+            using var response = (await AppHttpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead)).EnsureSuccessStatusCode();
+
+            if (response.StatusCode == HttpStatusCode.OK)// server doesn't response a partial content
+            {
+                downloadedBytes = 0;
+                fileStream.Seek(0, SeekOrigin.Begin);
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync();
+            var totalBytes = downloadedBytes + (response.Content.Headers.ContentLength ?? long.MaxValue - downloadedBytes);
+
+            const int blockSize = 1048576 / 4;
+            var buffer = new byte[blockSize];
+
+            while (downloadedBytes < totalBytes)
+            {
+                var recevied = await stream.ReadAsync(buffer);
+
+                if (recevied == 0) break;
+
+                await fileStream.WriteAsync(buffer.AsMemory(0, recevied));
+                await fileStream.FlushAsync();
+                downloadedBytes += recevied;
+                onProgress(downloadedBytes - fromPosition, totalBytes);
+            }
         }
     }
 }
